@@ -709,7 +709,9 @@ func refreshAuth(req authRefreshRequest) ([]byte, error) {
 		}
 	} else {
 		// A catalogue failure must not invalidate working credentials or their cache.
-		_ = refreshCatalog(req.HostCallbackID, &stored)
+		if time.Now().Unix() >= stored.CatalogNextCheck {
+			_ = refreshCatalog(req.HostCallbackID, &stored)
+		}
 		auth = storedAuthData(stored, fileName)
 	}
 	return ok(authRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter})
@@ -753,7 +755,9 @@ func tokenAuth(callbackID string, tokens tokenResponse, label, fileName string, 
 		stored.CatalogFetchedAt = previous.CatalogFetchedAt
 		stored.CatalogNextCheck = previous.CatalogNextCheck
 	}
-	_ = refreshCatalog(callbackID, &stored)
+	if time.Now().Unix() >= stored.CatalogNextCheck {
+		_ = refreshCatalog(callbackID, &stored)
+	}
 	storage, _ := json.Marshal(stored)
 	email, _ := claims["email"].(string)
 	if email != "" {

@@ -64,7 +64,7 @@ const (
 	abiVersion      = 1
 	schemaVersion   = 10
 	provider        = "mistral-vibe"
-	vibeUserAgent   = "Mistral-Vibe/CLIProxyAPI"
+	vibeUserAgent   = "Mistral-Vibe"
 	clientID        = "829da7e7-628f-4795-829a-8cca609c76d4"
 	tokenURL        = "https://auth.mistral.ai/oauth2/token"
 	workspaceURL    = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"

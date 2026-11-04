@@ -10,7 +10,7 @@ Store the Vibe key in a private JSON file in CLIProxyAPI's auth directory (mode 
 {"type":"mistral-vibe","api_key":"<VIBE_SCOPED_KEY>"}
 ```
 
-For an existing OAuth credential, add `api_key` to that file instead of creating a second credential. The key determines its own workspace; OAuth workspace headers are not forwarded with it. Key credentials refresh the model catalogue without renewing or expiring with an unused OAuth token. All plugin HTTP requests use `User-Agent: Mistral-Vibe/CLIProxyAPI`.
+For an existing OAuth credential, add `api_key` to that file instead of creating a second credential. The key determines its own workspace; OAuth workspace headers are not forwarded with it. Key credentials refresh the model catalogue without renewing or expiring with an unused OAuth token. All plugin HTTP requests use `User-Agent: Mistral-Vibe`.
 
 Implemented from the authentication flow documented by [omp-mistral-vibe](https://github.com/Microck/omp-mistral-vibe). This is an independent Go implementation, not an official Mistral integration.
 

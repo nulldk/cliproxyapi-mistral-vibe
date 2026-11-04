@@ -1,0 +1,10 @@
+*.so
+*.h
+*.dylib
+*.dll
+.env
+.env.*
+auth/
+plugins/
+config.yaml
+result

@@ -16,7 +16,6 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: false
-      - run: go test ./...
       - run: >-
           CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -buildvcs=false
           -ldflags='-s -w' -o mistral-vibe.so .

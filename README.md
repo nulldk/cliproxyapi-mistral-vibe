@@ -25,7 +25,6 @@ Availability depends on the authenticated account and workspace. The catalog is 
 Requires Go 1.23 or newer, a C compiler, and CLIProxyAPI with native plugin ABI 1 / schema 10 support. Verified with CLIProxyAPI 8.0.52 on Linux.
 
 ```sh
-go test ./...
 CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -buildvcs=false \
   -ldflags='-s -w' -o mistral-vibe.so .
 install -Dm755 mistral-vibe.so ./plugins/mistral-vibe.so

@@ -12,13 +12,9 @@ Implemented from the authentication flow documented by [omp-mistral-vibe](https:
 - HTTP status and `Retry-After` propagation to CLIProxyAPI, including HTTP-date headers.
 - Mistral models stay out of the Codex-specific model catalog.
 
-Currently registered models:
+Models are discovered from Mistral's authenticated `GET /v1/model-catalog?surface=vibe-code` endpoint, the same catalogue used by the [official Vibe client](https://github.com/mistralai/mistral-vibe). There are no fixed model IDs. The catalogue is checked at sign-in and every 30 minutes through CLIProxyAPI's credential refresh scheduler. Unexpired OAuth tokens are reused for catalogue checks.
 
-- `mistral-vibe/zai-glm-5-3`
-- `mistral-vibe/zai-glm-5-3-flash`
-- `mistral-vibe/deepseek-v4-1-flash-1017`
-
-Availability depends on the authenticated account and workspace. The catalog is static; upstream model changes may require a plugin update.
+The last successful catalogue is persisted with the credential, survives restarts, and is retained on transient errors; failed checks are retried after one minute. Successful responses replace the complete list, including removals and an empty catalogue. Only models supporting chat completions are registered. Names, context limits, and image support come from the catalogue. Client adapters can read these fields from `/v1/models`.
 
 ## Build and install
 

@@ -52,6 +52,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,19 +61,23 @@ import (
 )
 
 const (
-	abiVersion    = 1
-	schemaVersion = 10
-	provider      = "mistral-vibe"
-	clientID      = "829da7e7-628f-4795-829a-8cca609c76d4"
-	tokenURL      = "https://auth.mistral.ai/oauth2/token"
-	workspaceURL  = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"
-	apiBaseURL    = "https://api.mistral.ai/v1"
-	redirectURI   = "http://127.0.0.1:8766/callback"
+	abiVersion      = 1
+	schemaVersion   = 10
+	provider        = "mistral-vibe"
+	clientID        = "829da7e7-628f-4795-829a-8cca609c76d4"
+	tokenURL        = "https://auth.mistral.ai/oauth2/token"
+	workspaceURL    = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"
+	apiBaseURL      = "https://api.mistral.ai/v1"
+	catalogInterval = 30 * time.Minute
+	catalogRetry    = time.Minute
+	redirectURI     = "http://127.0.0.1:8766/callback"
 )
 
 var (
-	flowMu sync.Mutex
-	flows  = map[string]oauthFlow{}
+	flowMu          sync.Mutex
+	flows           = map[string]oauthFlow{}
+	catalogMu       sync.RWMutex
+	catalogMetadata = map[string]modelInfo{}
 )
 
 type envelope struct {
@@ -103,15 +108,18 @@ type tokenResponse struct {
 }
 
 type storedAuth struct {
-	Type         string `json:"type,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	AccessToken  string `json:"access_token,omitempty"`
-	IDToken      string `json:"id_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresAt    int64  `json:"expires_at,omitempty"`
-	OrgID        string `json:"org_id,omitempty"`
-	WorkspaceID  string `json:"workspace_id,omitempty"`
-	Label        string `json:"label,omitempty"`
+	Type             string      `json:"type,omitempty"`
+	Provider         string      `json:"provider,omitempty"`
+	AccessToken      string      `json:"access_token,omitempty"`
+	IDToken          string      `json:"id_token,omitempty"`
+	RefreshToken     string      `json:"refresh_token,omitempty"`
+	ExpiresAt        int64       `json:"expires_at,omitempty"`
+	OrgID            string      `json:"org_id,omitempty"`
+	WorkspaceID      string      `json:"workspace_id,omitempty"`
+	Label            string      `json:"label,omitempty"`
+	ModelCatalog     []modelInfo `json:"model_catalog,omitempty"`
+	CatalogFetchedAt int64       `json:"model_catalog_fetched_at,omitempty"`
+	CatalogNextCheck int64       `json:"model_catalog_next_check,omitempty"`
 }
 
 type callbackPayload struct {
@@ -201,12 +209,15 @@ type modelInfo struct {
 	ContextLength            int64    `json:"ContextLength"`
 	MaxCompletionTokens      int64    `json:"MaxCompletionTokens"`
 	SupportedInputModalities []string `json:"SupportedInputModalities,omitempty"`
+	Recommended              bool     `json:"Recommended,omitempty"`
+	Description              string   `json:"Description,omitempty"`
 	UserDefined              bool     `json:"UserDefined"`
 }
 
 type modelResponse struct {
-	Provider string      `json:"Provider"`
-	Models   []modelInfo `json:"Models"`
+	Provider   string      `json:"Provider"`
+	Models     []modelInfo `json:"Models"`
+	AuthUpdate *authData   `json:"AuthUpdate,omitempty"`
 }
 
 type executorRequest struct {
@@ -354,8 +365,14 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		return refreshAuth(req)
-	case "model.register":
-		return ok(modelResponse{Provider: provider, Models: models()})
+	case "model.static":
+		return ok(modelResponse{Provider: provider, Models: []modelInfo{}})
+	case "model.for_auth":
+		var req authRefreshRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		return modelsForAuth(req)
 	case "response.intercept_after":
 		var req struct{ Body []byte }
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -392,16 +409,16 @@ func pluginRegistration() map[string]any {
 		"schema_version": schemaVersion,
 		"metadata": map[string]any{
 			"Name":             "mistral-vibe",
-			"Version":          "0.1.0",
+			"Version":          "0.2.0",
 			"Author":           "Mistral Vibe Plugin contributors",
 			"GitHubRepository": "https://github.com/nulldk/cliproxyapi-mistral-vibe",
 			"ConfigFields":     []any{},
 		},
 		"capabilities": map[string]any{
-			"model_registrar":         true,
+			"model_provider":          true,
 			"auth_provider":           true,
 			"executor":                true,
-			"executor_model_scope":    "both",
+			"executor_model_scope":    "oauth",
 			"executor_input_formats":  []string{"chat-completions"},
 			"executor_output_formats": []string{"chat-completions"},
 			"response_interceptor":    true,
@@ -409,24 +426,131 @@ func pluginRegistration() map[string]any {
 	}
 }
 
-func models() []modelInfo {
-	names := []struct{ id, label string }{
-		{"zai-glm-5-3", "GLM 5.3"},
-		{"zai-glm-5-3-flash", "GLM 5.3 Flash"},
-		{"deepseek-v4-1-flash-1017", "DeepSeek V4.1 Flash"},
+// Catalogue checks share the host's credential scheduler and fenced auth updates.
+func storedAuthData(stored storedAuth, id string) authData {
+	storage, _ := json.Marshal(stored)
+	return authData{Provider: provider, ID: id, FileName: id, Label: stored.Label, StorageJSON: storage, Metadata: authMetadata(stored), NextRefreshAfter: nextRefresh(stored)}
+}
+
+func rememberCatalog(stored storedAuth) {
+	catalogMu.Lock()
+	defer catalogMu.Unlock()
+	for _, model := range stored.ModelCatalog {
+		catalogMetadata[model.ID] = model
 	}
-	out := make([]modelInfo, 0, len(names))
-	for _, item := range names {
-		// Public IDs retain the provider; ensureModel strips it for Mistral.
-		publicID := provider + "/" + item.id
-		out = append(out, modelInfo{ID: publicID, Object: "model", OwnedBy: provider, DisplayName: "Mistral " + item.label, Name: publicID, ContextLength: 1048576, MaxCompletionTokens: 8192, SupportedInputModalities: []string{"text"}, UserDefined: true})
+}
+
+func refreshCatalog(callbackID string, stored *storedAuth) error {
+	stored.CatalogNextCheck = time.Now().Add(catalogRetry).Unix()
+	headers := authHeaders(*stored, nil)
+	headers["Accept"] = []string{"application/json"}
+	resp, err := hostHTTP(callbackID, "GET", apiBaseURL+"/model-catalog?surface=vibe-code", headers, nil)
+	if err != nil {
+		return err
 	}
-	return out
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Mistral model catalogue request failed (HTTP %d)", resp.StatusCode)
+	}
+	var catalog struct {
+		Models json.RawMessage `json:"models"`
+	}
+	if json.Unmarshal(resp.Body, &catalog) != nil || len(catalog.Models) == 0 || catalog.Models[0] != '[' {
+		return fmt.Errorf("invalid Mistral model catalogue")
+	}
+	var entries []json.RawMessage
+	if json.Unmarshal(catalog.Models, &entries) != nil {
+		return fmt.Errorf("invalid Mistral model catalogue")
+	}
+	models := make([]modelInfo, 0, len(entries))
+	seen := map[string]bool{}
+	for _, raw := range entries {
+		var entry struct {
+			ID            string `json:"id"`
+			Label         string `json:"label"`
+			Description   string `json:"description"`
+			Recommended   bool   `json:"recommended"`
+			ContextLength int64  `json:"max_context_length"`
+			Capabilities  struct {
+				Chat   bool `json:"completion_chat"`
+				Vision bool `json:"vision"`
+			} `json:"capabilities"`
+		}
+		if json.Unmarshal(raw, &entry) != nil || strings.TrimSpace(entry.ID) == "" || strings.TrimSpace(entry.Label) == "" || !entry.Capabilities.Chat || seen[entry.ID] {
+			continue
+		}
+		seen[entry.ID] = true
+		modalities := []string{"text"}
+		if entry.Capabilities.Vision {
+			modalities = append(modalities, "image")
+		}
+		id := provider + "/" + entry.ID
+		models = append(models, modelInfo{ID: id, Object: "model", OwnedBy: provider, DisplayName: entry.Label, Name: id, Description: entry.Description, ContextLength: entry.ContextLength, SupportedInputModalities: modalities, Recommended: entry.Recommended, UserDefined: true})
+	}
+	sort.SliceStable(models, func(i, j int) bool { return models[i].Recommended && !models[j].Recommended })
+	stored.ModelCatalog = models
+	stored.CatalogFetchedAt = time.Now().Unix()
+	stored.CatalogNextCheck = time.Now().Add(catalogInterval).Unix()
+	rememberCatalog(*stored)
+	return nil
+}
+
+func modelsForAuth(req authRefreshRequest) ([]byte, error) {
+	var stored storedAuth
+	if err := json.Unmarshal(req.StorageJSON, &stored); err != nil {
+		return nil, fmt.Errorf("decode Mistral credentials: %w", err)
+	}
+	resp := modelResponse{Provider: provider, Models: stored.ModelCatalog}
+	// Let auth.refresh renew expired credentials before discovering models.
+	if time.Now().Unix() >= stored.CatalogNextCheck && stored.ExpiresAt > time.Now().Add(time.Minute).Unix() {
+		err := refreshCatalog(req.HostCallbackID, &stored)
+		if err != nil && stored.CatalogFetchedAt == 0 {
+			return nil, err
+		}
+		updated := storedAuthData(stored, req.AuthID)
+		resp.AuthUpdate = &updated
+	}
+	if stored.CatalogFetchedAt == 0 {
+		return nil, fmt.Errorf("Mistral model catalogue is awaiting credential refresh")
+	}
+	rememberCatalog(stored)
+	resp.Models = stored.ModelCatalog
+	if resp.Models == nil {
+		resp.Models = []modelInfo{}
+	}
+	return ok(resp)
 }
 
 func filterCodexCatalog(body []byte) ([]byte, error) {
 	var catalog map[string]json.RawMessage
-	if json.Unmarshal(body, &catalog) != nil || catalog["models"] == nil {
+	if json.Unmarshal(body, &catalog) != nil {
+		return nil, nil
+	}
+	if catalog["data"] != nil {
+		var entries []map[string]any
+		if json.Unmarshal(catalog["data"], &entries) != nil {
+			return nil, nil
+		}
+		changed := false
+		catalogMu.RLock()
+		for _, entry := range entries {
+			id, _ := entry["id"].(string)
+			if model, exists := catalogMetadata[id]; exists && entry["owned_by"] == provider {
+				entry["display_name"] = model.DisplayName
+				entry["context_length"] = model.ContextLength
+				entry["max_completion_tokens"] = model.MaxCompletionTokens
+				entry["input_modalities"] = model.SupportedInputModalities
+				entry["recommended"] = model.Recommended
+				changed = true
+			}
+		}
+		catalogMu.RUnlock()
+		if !changed {
+			return nil, nil
+		}
+		catalog["data"], _ = json.Marshal(entries)
+		return json.Marshal(catalog)
+	}
+	if catalog["models"] == nil {
 		return nil, nil
 	}
 	var entries []json.RawMessage
@@ -472,6 +596,7 @@ func parseAuth(req authRequest) ([]byte, error) {
 	}
 	stored.Provider = provider
 	stored.Type = provider
+	rememberCatalog(stored)
 	storage, _ := json.Marshal(stored)
 	return ok(authParseResponse{Handled: true, Auth: authData{Provider: provider, ID: id, FileName: fileName, Label: label, StorageJSON: storage, Metadata: authMetadata(stored), NextRefreshAfter: nextRefresh(stored)}})
 }
@@ -481,10 +606,12 @@ func authMetadata(stored storedAuth) map[string]any {
 }
 
 func nextRefresh(stored storedAuth) time.Time {
-	if stored.ExpiresAt <= 0 {
-		return time.Now()
+	tokenDue := time.Unix(stored.ExpiresAt, 0).Add(-time.Minute)
+	catalogDue := time.Unix(stored.CatalogNextCheck, 0)
+	if catalogDue.Before(tokenDue) {
+		return catalogDue
 	}
-	return time.Unix(stored.ExpiresAt, 0).Add(-time.Minute)
+	return tokenDue
 }
 
 func startLogin(req authStartRequest) ([]byte, error) {
@@ -563,22 +690,29 @@ func refreshAuth(req authRefreshRequest) ([]byte, error) {
 	if err := json.Unmarshal(req.StorageJSON, &stored); err != nil {
 		return nil, fmt.Errorf("decode Mistral credentials: %w", err)
 	}
-	if stored.RefreshToken == "" {
-		return nil, fmt.Errorf("Mistral refresh token is missing; sign in again")
-	}
-	tokens, err := exchangeTokens(req.HostCallbackID, map[string]string{"grant_type": "refresh_token", "refresh_token": stored.RefreshToken}, &stored)
-	if err != nil {
-		return nil, err
-	}
 	fileName := req.AuthID
 	if !strings.HasSuffix(strings.ToLower(fileName), ".json") {
 		fileName += ".json"
 	}
-	auth, err := tokenAuth(req.HostCallbackID, tokens, "Mistral Vibe", fileName, &stored)
-	if err != nil {
-		return nil, err
+	var auth authData
+	if stored.ExpiresAt <= time.Now().Add(time.Minute).Unix() {
+		if stored.RefreshToken == "" {
+			return nil, fmt.Errorf("Mistral refresh token is missing; sign in again")
+		}
+		tokens, err := exchangeTokens(req.HostCallbackID, map[string]string{"grant_type": "refresh_token", "refresh_token": stored.RefreshToken}, &stored)
+		if err != nil {
+			return nil, err
+		}
+		auth, err = tokenAuth(req.HostCallbackID, tokens, stored.Label, fileName, &stored)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// A catalogue failure must not invalidate working credentials or their cache.
+		_ = refreshCatalog(req.HostCallbackID, &stored)
+		auth = storedAuthData(stored, fileName)
 	}
-	return ok(authRefreshResponse{Auth: auth, NextRefreshAfter: time.Now().Add(time.Duration(tokens.ExpiresIn-60) * time.Second)})
+	return ok(authRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter})
 }
 
 func tokenAuth(callbackID string, tokens tokenResponse, label, fileName string, previous *storedAuth) (authData, error) {
@@ -614,6 +748,12 @@ func tokenAuth(callbackID string, tokens tokenResponse, label, fileName string, 
 		fileName = provider + ".json"
 	}
 	stored := storedAuth{Type: provider, Provider: provider, AccessToken: tokens.AccessToken, IDToken: tokens.IDToken, RefreshToken: tokens.RefreshToken, ExpiresAt: time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second).Unix(), OrgID: orgID, WorkspaceID: workspaceID, Label: label}
+	if previous != nil {
+		stored.ModelCatalog = previous.ModelCatalog
+		stored.CatalogFetchedAt = previous.CatalogFetchedAt
+		stored.CatalogNextCheck = previous.CatalogNextCheck
+	}
+	_ = refreshCatalog(callbackID, &stored)
 	storage, _ := json.Marshal(stored)
 	email, _ := claims["email"].(string)
 	if email != "" {

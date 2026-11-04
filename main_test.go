@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,25 @@ func TestVibeCredentialRouting(t *testing.T) {
 	for _, execute := range []func(executorRequest) ([]byte, error){execute, executeStream} {
 		if _, err := execute(request); err == nil || !strings.Contains(err.Error(), "Vibe-scoped api_key") {
 			t.Fatalf("OAuth-only inference must fail before consuming API budget: %v", err)
+		}
+	}
+}
+
+func TestStaticModelSurvivesCachedCatalogue(t *testing.T) {
+	extra := staticModels()[0]
+	for _, models := range [][]modelInfo{{}, {extra}} {
+		stored := storedAuth{APIKey: "vibe-key", ModelCatalog: models, CatalogFetchedAt: 1, CatalogNextCheck: time.Now().Add(catalogInterval).Unix()}
+		raw, _ := json.Marshal(stored)
+		result, err := modelsForAuth(authRefreshRequest{StorageJSON: raw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response struct{ Result modelResponse }
+		if err := json.Unmarshal(result, &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Result.Models) != 1 || response.Result.Models[0].ID != extra.ID {
+			t.Fatalf("static model missing or duplicated: %s", result)
 		}
 	}
 }

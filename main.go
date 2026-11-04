@@ -368,7 +368,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		}
 		return refreshAuth(req)
 	case "model.static":
-		return ok(modelResponse{Provider: provider, Models: []modelInfo{}})
+		return ok(modelResponse{Provider: provider, Models: staticModels()})
 	case "model.for_auth":
 		var req authRefreshRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -496,6 +496,11 @@ func refreshCatalog(callbackID string, stored *storedAuth) error {
 	return nil
 }
 
+func staticModels() []modelInfo {
+	id := provider + "/deepseek-v4-1-flash-1017"
+	return []modelInfo{{ID: id, Object: "model", OwnedBy: provider, DisplayName: "DeepSeek V4.1 Flash", Name: id, ContextLength: 1048576, MaxCompletionTokens: 8192, SupportedInputModalities: []string{"text"}, UserDefined: true}}
+}
+
 func modelsForAuth(req authRefreshRequest) ([]byte, error) {
 	var stored storedAuth
 	if err := json.Unmarshal(req.StorageJSON, &stored); err != nil {
@@ -518,6 +523,15 @@ func modelsForAuth(req authRefreshRequest) ([]byte, error) {
 	resp.Models = stored.ModelCatalog
 	if resp.Models == nil {
 		resp.Models = []modelInfo{}
+	}
+	for _, extra := range staticModels() {
+		found := false
+		for _, model := range resp.Models {
+			found = found || model.ID == extra.ID
+		}
+		if !found {
+			resp.Models = append(resp.Models, extra)
+		}
 	}
 	return ok(resp)
 }

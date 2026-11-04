@@ -1,6 +1,16 @@
 # Mistral Vibe for CLIProxyAPI
 
-Native CLIProxyAPI provider plugin for Mistral Vibe OAuth subscriptions. It exposes an OpenAI-compatible Chat Completions API while CLIProxyAPI owns credentials, transport, retries, and cooldowns.
+Native CLIProxyAPI provider plugin for Mistral Vibe subscriptions. It exposes an OpenAI-compatible Chat Completions API while CLIProxyAPI owns credentials, transport, retries, and cooldowns.
+
+Inference requires a **Vibe-scoped key** obtained through the official Vibe sign-in or key page. OAuth user tokens alone consume the separate API budget, even when the account has a Vibe subscription. The plugin refuses OAuth-only inference to prevent unexpected API usage. A regular workspace API key is not a Vibe key.
+
+Store the Vibe key in a private JSON file in CLIProxyAPI's auth directory (mode `0600`):
+
+```json
+{"type":"mistral-vibe","api_key":"<VIBE_SCOPED_KEY>"}
+```
+
+For an existing OAuth credential, add `api_key` to that file instead of creating a second credential. The key determines its own workspace; OAuth workspace headers are not forwarded with it. Key credentials refresh the model catalogue without renewing or expiring with an unused OAuth token. All plugin HTTP requests use `User-Agent: Mistral-Vibe/CLIProxyAPI`.
 
 Implemented from the authentication flow documented by [omp-mistral-vibe](https://github.com/Microck/omp-mistral-vibe). This is an independent Go implementation, not an official Mistral integration.
 
@@ -39,7 +49,9 @@ plugins:
 
 Restart CLIProxyAPI after replacing the shared library. Build on the target architecture, or configure a suitable C cross-compiler.
 
-## Sign in
+## OAuth sign in (account discovery only)
+
+This optional flow discovers the account and models; add a Vibe-scoped `api_key` before using inference.
 
 Set `CLIPROXY_URL` to your gateway URL and `MANAGEMENT_KEY` to its management key. The example uses the default local gateway address.
 

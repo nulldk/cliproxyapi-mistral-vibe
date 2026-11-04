@@ -64,6 +64,7 @@ const (
 	abiVersion      = 1
 	schemaVersion   = 10
 	provider        = "mistral-vibe"
+	vibeUserAgent   = "Mistral-Vibe/CLIProxyAPI"
 	clientID        = "829da7e7-628f-4795-829a-8cca609c76d4"
 	tokenURL        = "https://auth.mistral.ai/oauth2/token"
 	workspaceURL    = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"
@@ -110,6 +111,7 @@ type tokenResponse struct {
 type storedAuth struct {
 	Type             string      `json:"type,omitempty"`
 	Provider         string      `json:"provider,omitempty"`
+	APIKey           string      `json:"api_key,omitempty"`
 	AccessToken      string      `json:"access_token,omitempty"`
 	IDToken          string      `json:"id_token,omitempty"`
 	RefreshToken     string      `json:"refresh_token,omitempty"`
@@ -366,7 +368,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		}
 		return refreshAuth(req)
 	case "model.static":
-		return ok(modelResponse{Provider: provider, Models: []modelInfo{}})
+		return ok(modelResponse{Provider: provider, Models: staticModels()})
 	case "model.for_auth":
 		var req authRefreshRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -409,7 +411,7 @@ func pluginRegistration() map[string]any {
 		"schema_version": schemaVersion,
 		"metadata": map[string]any{
 			"Name":             "mistral-vibe",
-			"Version":          "0.2.0",
+			"Version":          "0.3.0",
 			"Author":           "Mistral Vibe Plugin contributors",
 			"GitHubRepository": "https://github.com/nulldk/cliproxyapi-mistral-vibe",
 			"ConfigFields":     []any{},
@@ -494,6 +496,11 @@ func refreshCatalog(callbackID string, stored *storedAuth) error {
 	return nil
 }
 
+func staticModels() []modelInfo {
+	id := provider + "/deepseek-v4-1-flash-1017"
+	return []modelInfo{{ID: id, Object: "model", OwnedBy: provider, DisplayName: "DeepSeek V4.1 Flash", Name: id, ContextLength: 1048576, MaxCompletionTokens: 8192, SupportedInputModalities: []string{"text"}, UserDefined: true}}
+}
+
 func modelsForAuth(req authRefreshRequest) ([]byte, error) {
 	var stored storedAuth
 	if err := json.Unmarshal(req.StorageJSON, &stored); err != nil {
@@ -501,7 +508,7 @@ func modelsForAuth(req authRefreshRequest) ([]byte, error) {
 	}
 	resp := modelResponse{Provider: provider, Models: stored.ModelCatalog}
 	// Let auth.refresh renew expired credentials before discovering models.
-	if time.Now().Unix() >= stored.CatalogNextCheck && stored.ExpiresAt > time.Now().Add(time.Minute).Unix() {
+	if time.Now().Unix() >= stored.CatalogNextCheck && (stored.APIKey != "" || stored.ExpiresAt > time.Now().Add(time.Minute).Unix()) {
 		err := refreshCatalog(req.HostCallbackID, &stored)
 		if err != nil && stored.CatalogFetchedAt == 0 {
 			return nil, err
@@ -516,6 +523,15 @@ func modelsForAuth(req authRefreshRequest) ([]byte, error) {
 	resp.Models = stored.ModelCatalog
 	if resp.Models == nil {
 		resp.Models = []modelInfo{}
+	}
+	for _, extra := range staticModels() {
+		found := false
+		for _, model := range resp.Models {
+			found = found || model.ID == extra.ID
+		}
+		if !found {
+			resp.Models = append(resp.Models, extra)
+		}
 	}
 	return ok(resp)
 }
@@ -579,7 +595,7 @@ func parseAuth(req authRequest) ([]byte, error) {
 		return ok(authParseResponse{Handled: false})
 	}
 	kind := strings.ToLower(strings.TrimSpace(stored.Type + " " + stored.Provider))
-	if !strings.Contains(kind, "mistral") || (stored.IDToken == "" && stored.AccessToken == "") {
+	if !strings.Contains(kind, "mistral") || (stored.APIKey == "" && stored.IDToken == "" && stored.AccessToken == "") {
 		return ok(authParseResponse{Handled: false})
 	}
 	fileName := strings.TrimSpace(req.FileName)
@@ -602,10 +618,16 @@ func parseAuth(req authRequest) ([]byte, error) {
 }
 
 func authMetadata(stored storedAuth) map[string]any {
+	if stored.APIKey != "" {
+		return map[string]any{"type": provider, "refresh_interval_seconds": 60}
+	}
 	return map[string]any{"type": provider, "oauth_provider": provider, "org_id": stored.OrgID, "workspace_id": stored.WorkspaceID, "expires_at": stored.ExpiresAt, "refresh_interval_seconds": 60}
 }
 
 func nextRefresh(stored storedAuth) time.Time {
+	if stored.APIKey != "" {
+		return time.Unix(stored.CatalogNextCheck, 0)
+	}
 	tokenDue := time.Unix(stored.ExpiresAt, 0).Add(-time.Minute)
 	catalogDue := time.Unix(stored.CatalogNextCheck, 0)
 	if catalogDue.Before(tokenDue) {
@@ -695,7 +717,7 @@ func refreshAuth(req authRefreshRequest) ([]byte, error) {
 		fileName += ".json"
 	}
 	var auth authData
-	if stored.ExpiresAt <= time.Now().Add(time.Minute).Unix() {
+	if stored.APIKey == "" && stored.ExpiresAt <= time.Now().Add(time.Minute).Unix() {
 		if stored.RefreshToken == "" {
 			return nil, fmt.Errorf("Mistral refresh token is missing; sign in again")
 		}
@@ -751,6 +773,7 @@ func tokenAuth(callbackID string, tokens tokenResponse, label, fileName string, 
 	}
 	stored := storedAuth{Type: provider, Provider: provider, AccessToken: tokens.AccessToken, IDToken: tokens.IDToken, RefreshToken: tokens.RefreshToken, ExpiresAt: time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second).Unix(), OrgID: orgID, WorkspaceID: workspaceID, Label: label}
 	if previous != nil {
+		stored.APIKey = previous.APIKey
 		stored.ModelCatalog = previous.ModelCatalog
 		stored.CatalogFetchedAt = previous.CatalogFetchedAt
 		stored.CatalogNextCheck = previous.CatalogNextCheck
@@ -856,6 +879,9 @@ func execute(req executorRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if stored.APIKey == "" {
+		return nil, fmt.Errorf("a Vibe-scoped api_key is required for inference; OAuth user tokens consume the API budget")
+	}
 	body := req.Payload
 	if len(body) == 0 {
 		body = req.OriginalRequest
@@ -884,6 +910,9 @@ func executeStream(req executorRequest) ([]byte, error) {
 	stored, err := credentials(req.StorageJSON)
 	if err != nil {
 		return nil, err
+	}
+	if stored.APIKey == "" {
+		return nil, fmt.Errorf("a Vibe-scoped api_key is required for inference; OAuth user tokens consume the API budget")
 	}
 	body := req.Payload
 	if len(body) == 0 {
@@ -1081,8 +1110,8 @@ func credentials(raw []byte) (storedAuth, error) {
 	if err := json.Unmarshal(raw, &stored); err != nil {
 		return stored, fmt.Errorf("decode Mistral credentials: %w", err)
 	}
-	if stored.IDToken == "" && stored.AccessToken == "" {
-		return stored, fmt.Errorf("Mistral OAuth credential has no token")
+	if stored.APIKey == "" && stored.IDToken == "" && stored.AccessToken == "" {
+		return stored, fmt.Errorf("Mistral credential has no key or token")
 	}
 	return stored, nil
 }
@@ -1090,17 +1119,26 @@ func credentials(raw []byte) (storedAuth, error) {
 func authHeaders(stored storedAuth, existing map[string][]string) map[string][]string {
 	headers := map[string][]string{}
 	for key, values := range existing {
+		switch strings.ToLower(key) {
+		case "authorization", "user-agent", "x-external-organization-id", "x-external-workspace-id":
+			continue
+		}
 		headers[key] = append([]string(nil), values...)
 	}
-	token := stored.IDToken
+	token := stored.APIKey
+	if token == "" {
+		token = stored.IDToken
+	}
 	if token == "" {
 		token = stored.AccessToken
 	}
 	headers["Authorization"] = []string{"Bearer " + token}
 	headers["Content-Type"] = []string{"application/json"}
 	headers["Accept"] = []string{"text/event-stream"}
-	headers["x-external-organization-id"] = []string{stored.OrgID}
-	headers["x-external-workspace-id"] = []string{stored.WorkspaceID}
+	if stored.APIKey == "" {
+		headers["x-external-organization-id"] = []string{stored.OrgID}
+		headers["x-external-workspace-id"] = []string{stored.WorkspaceID}
+	}
 	return headers
 }
 
@@ -1175,7 +1213,7 @@ func hostHTTP(callbackID, method, target string, headers map[string][]string, bo
 	if headers == nil {
 		headers = map[string][]string{}
 	}
-	headers["User-Agent"] = []string{"Google"}
+	headers["User-Agent"] = []string{vibeUserAgent}
 	raw, err := callHost("host.http.do", map[string]any{"host_callback_id": callbackID, "method": method, "url": target, "headers": headers, "body": body})
 	if err != nil {
 		return hostHTTPResponse{}, err
@@ -1190,7 +1228,7 @@ func hostHTTPStream(callbackID, method, target string, headers map[string][]stri
 	if headers == nil {
 		headers = map[string][]string{}
 	}
-	headers["User-Agent"] = []string{"Google"}
+	headers["User-Agent"] = []string{vibeUserAgent}
 	raw, err := callHost("host.http.do_stream", map[string]any{"host_callback_id": callbackID, "method": method, "url": target, "headers": headers, "body": body})
 	if err != nil {
 		return hostHTTPStreamResponse{}, err

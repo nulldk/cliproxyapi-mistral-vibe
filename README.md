@@ -4,6 +4,8 @@ Native CLIProxyAPI provider plugin for Mistral Vibe subscriptions. It exposes an
 
 Inference requires a **Vibe-scoped key** obtained through the official Vibe sign-in or key page. OAuth user tokens alone consume the separate API budget, even when the account has a Vibe subscription. The plugin refuses OAuth-only inference to prevent unexpected API usage. A regular workspace API key is not a Vibe key.
 
+Each inference request is stamped with `metadata.call_source: "vibe_code"` (plus `call_type: "main_call"` when the caller sets none), merged into any caller metadata. Mistral only bills requests carrying the Vibe call source against the **Vibe & Studio** included budget; unmarked requests consume the separate API included budget even with a Vibe key.
+
 Store the Vibe key in a private JSON file in CLIProxyAPI's auth directory (mode `0600`):
 
 ```json
@@ -21,8 +23,11 @@ Implemented from the authentication flow documented by [omp-mistral-vibe](https:
 - Streaming, tool calls, and conversion between Mistral thinking blocks and OpenAI reasoning fields.
 - HTTP status and `Retry-After` propagation to CLIProxyAPI, including HTTP-date headers.
 - Mistral models stay out of the Codex-specific model catalog.
+- A quota provider exposes both included budgets (`vibe_budget` and `api_budget` from `GET /v1/billing/budget`) through CLIProxyAPI's management quota endpoints (`/v0/management/quota/providers`, `/v0/management/quota/fetch`), with a one-minute per-credential cache so management polling does not spam the billing API.
 
 Models are discovered from Mistral's authenticated `GET /v1/model-catalog?surface=vibe-code` endpoint, the same catalogue used by the [official Vibe client](https://github.com/mistralai/mistral-vibe). `deepseek-v4-1-flash-1017` is also registered statically because it supports Vibe keys but is absent from the catalogue. The catalogue is checked at sign-in and every 30 minutes through CLIProxyAPI's credential refresh scheduler. Unexpired OAuth tokens are reused for catalogue checks. The host may invoke credential refresh more frequently; the plugin reuses its cached catalogue until its next check is due, including during token renewal.
+
+The quota provider normalizes each budget into CLIProxyAPI's quota shape: one monthly quota bucket per included budget (remaining fraction and `reset_at`) plus `vibe_initial`/`vibe_remaining`/`api_initial`/`api_remaining` currency summary metrics. Quota answers cache per credential for one minute; fetch failures never cache and never affect inference. Reset is unsupported: included budgets renew with the plan.
 
 The last successful catalogue is persisted with the credential, survives restarts, and is retained on transient errors; failed checks are retried after one minute. Successful responses replace the complete list, including removals and an empty catalogue. Only models supporting chat completions are registered. Names, context limits, and image support come from the catalogue. Client adapters can read these fields from `/v1/models`.
 

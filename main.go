@@ -65,12 +65,16 @@ const (
 	schemaVersion   = 10
 	provider        = "mistral-vibe"
 	vibeUserAgent   = "Mistral-Vibe"
+	vibeCallSource  = "vibe_code"
+	vibeCallType    = "main_call"
 	clientID        = "829da7e7-628f-4795-829a-8cca609c76d4"
 	tokenURL        = "https://auth.mistral.ai/oauth2/token"
 	workspaceURL    = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"
 	apiBaseURL      = "https://api.mistral.ai/v1"
+	budgetURL       = apiBaseURL + "/billing/budget"
 	catalogInterval = 30 * time.Minute
 	catalogRetry    = time.Minute
+	quotaCacheTTL   = time.Minute
 	redirectURI     = "http://127.0.0.1:8766/callback"
 )
 
@@ -79,6 +83,8 @@ var (
 	flows           = map[string]oauthFlow{}
 	catalogMu       sync.RWMutex
 	catalogMetadata = map[string]modelInfo{}
+	quotaMu         sync.Mutex
+	quotaCache      = map[string]cachedQuota{}
 )
 
 type envelope struct {
@@ -249,6 +255,62 @@ type executorStreamResponse struct {
 	Chunks  []streamChunk       `json:"Chunks,omitempty"`
 }
 
+type quotaFetchRequest struct {
+	AuthID         string         `json:"auth_id"`
+	AuthProvider   string         `json:"provider"`
+	StorageJSON    []byte         `json:"storage_json,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	HostCallbackID string         `json:"host_callback_id,omitempty"`
+}
+
+type quotaDescribeResponse struct {
+	SupportedProviders []string `json:"supported_providers,omitempty"`
+	DisplayName        string   `json:"display_name,omitempty"`
+	SupportsReset      bool     `json:"supports_reset"`
+}
+
+type quotaFetchResponse struct {
+	Summary []quotaMetric `json:"summary,omitempty"`
+	Groups  []quotaGroup  `json:"groups,omitempty"`
+}
+
+type quotaMetric struct {
+	Key      string  `json:"key"`
+	Label    string  `json:"label"`
+	Value    float64 `json:"value"`
+	Format   string  `json:"format,omitempty"`
+	Currency string  `json:"currency,omitempty"`
+}
+
+type quotaGroup struct {
+	DisplayName string        `json:"displayName,omitempty"`
+	Buckets     []quotaBucket `json:"buckets,omitempty"`
+}
+
+type quotaBucket struct {
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remainingFraction"`
+	ResetTime         string  `json:"resetTime,omitempty"`
+	Description       string  `json:"description,omitempty"`
+}
+
+type budgetDetail struct {
+	UsagePercentage float64 `json:"usage_percentage"`
+	InitialBudget   float64 `json:"initial_budget"`
+	Currency        string  `json:"currency"`
+	ResetAt         string  `json:"reset_at"`
+}
+
+type budgetResponse struct {
+	VibeBudget *budgetDetail `json:"vibe_budget"`
+	APIBudget  *budgetDetail `json:"api_budget"`
+}
+
+type cachedQuota struct {
+	response quotaFetchResponse
+	expires  time.Time
+}
+
 type streamChunk struct {
 	Payload []byte `json:"Payload,omitempty"`
 	Error   string `json:"Error,omitempty"`
@@ -401,6 +463,18 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		return executeStream(req)
 	case "executor.count_tokens":
 		return ok(executorResponse{Payload: []byte(`{"total_tokens":0}`), Headers: map[string][]string{"content-type": {"application/json"}}})
+	case "quota.identifier":
+		return ok(map[string]any{"identifier": provider, "identifiers": []string{provider, "mistral"}})
+	case "quota.describe":
+		return ok(quotaDescribeResponse{SupportedProviders: []string{provider, "mistral"}, DisplayName: "Mistral Vibe", SupportsReset: false})
+	case "quota.fetch":
+		var req quotaFetchRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		return fetchQuota(req)
+	case "quota.reset":
+		return errorEnvelope("unsupported", "Mistral included-usage budgets renew with the plan and cannot be reset", 405), nil
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, 500), nil
 	}
@@ -411,7 +485,7 @@ func pluginRegistration() map[string]any {
 		"schema_version": schemaVersion,
 		"metadata": map[string]any{
 			"Name":             "mistral-vibe",
-			"Version":          "0.3.0",
+			"Version":          "0.4.0",
 			"Author":           "Mistral Vibe Plugin contributors",
 			"GitHubRepository": "https://github.com/nulldk/cliproxyapi-mistral-vibe",
 			"ConfigFields":     []any{},
@@ -424,6 +498,7 @@ func pluginRegistration() map[string]any {
 			"executor_input_formats":  []string{"chat-completions"},
 			"executor_output_formats": []string{"chat-completions"},
 			"response_interceptor":    true,
+			"quota_provider":          true,
 		},
 	}
 }
@@ -1142,6 +1217,118 @@ func authHeaders(stored storedAuth, existing map[string][]string) map[string][]s
 	return headers
 }
 
+// ensureVibeMetadata stamps a request's metadata with the Vibe code call
+// source Mistral's budget attribution reads, preserving other fields and
+// call_type values clients may set themselves.
+func ensureVibeMetadata(existing any) map[string]any {
+	metadata := map[string]any{}
+	if raw, ok := existing.(map[string]any); ok {
+		for key, value := range raw {
+			metadata[key] = value
+		}
+	}
+	metadata["call_source"] = vibeCallSource
+	if _, ok := metadata["call_type"].(string); !ok {
+		metadata["call_type"] = vibeCallType
+	}
+	return metadata
+}
+
+// Quota answers cache per credential so management polling does not spam
+// Mistral's billing API; failures are never cached.
+func fetchQuota(req quotaFetchRequest) ([]byte, error) {
+	stored, err := credentials(req.StorageJSON)
+	if err != nil {
+		return nil, err
+	}
+	cached, cachedOK := quotaCacheLoad(req.AuthID, time.Now())
+	if cachedOK {
+		return ok(cached)
+	}
+	token := stored.APIKey
+	if token == "" {
+		token = stored.IDToken
+	}
+	if token == "" {
+		token = stored.AccessToken
+	}
+	headers := map[string][]string{"Accept": {"application/json"}, "Authorization": {"Bearer " + token}}
+	if stored.APIKey == "" {
+		headers["x-external-organization-id"] = []string{stored.OrgID}
+		headers["x-external-workspace-id"] = []string{stored.WorkspaceID}
+	}
+	resp, err := hostHTTP(req.HostCallbackID, "GET", budgetURL, headers, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Mistral budget request failed (HTTP %d)", resp.StatusCode)
+	}
+	quota, err := budgetQuotaResponse(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	quotaCacheStore(req.AuthID, quota, time.Now())
+	return ok(quota)
+}
+
+func budgetQuotaResponse(raw []byte) (quotaFetchResponse, error) {
+	var budget budgetResponse
+	if err := json.Unmarshal(raw, &budget); err != nil {
+		return quotaFetchResponse{}, fmt.Errorf("invalid Mistral budget response")
+	}
+	response := quotaFetchResponse{Groups: []quotaGroup{{DisplayName: "Included monthly usage"}}}
+	add := func(detail *budgetDetail, kind, label string) {
+		if detail == nil || detail.InitialBudget <= 0 {
+			return
+		}
+		remaining := 1 - detail.UsagePercentage/100
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining > 1 {
+			remaining = 1
+		}
+		currency := detail.Currency
+		if currency == "" {
+			currency = "EUR"
+		}
+		response.Summary = append(response.Summary,
+			quotaMetric{Key: kind + "_initial", Label: label + " allowance", Value: detail.InitialBudget, Format: "currency", Currency: currency},
+			quotaMetric{Key: kind + "_remaining", Label: label + " remaining", Value: detail.InitialBudget * remaining, Format: "currency", Currency: currency},
+		)
+		response.Groups[0].Buckets = append(response.Groups[0].Buckets, quotaBucket{
+			Window:            "monthly",
+			RemainingFraction: remaining,
+			ResetTime:         detail.ResetAt,
+			Description:       fmt.Sprintf("%s included usage (%.2f %s)", label, detail.InitialBudget, currency),
+		})
+	}
+	add(budget.VibeBudget, "vibe", "Vibe & Studio")
+	add(budget.APIBudget, "api", "API")
+	if len(response.Summary) == 0 {
+		return quotaFetchResponse{}, fmt.Errorf("Mistral budget response held no budgets")
+	}
+	return response, nil
+}
+
+func quotaCacheLoad(key string, now time.Time) (quotaFetchResponse, bool) {
+	quotaMu.Lock()
+	defer quotaMu.Unlock()
+	cached, exists := quotaCache[key]
+	if !exists || !now.Before(cached.expires) {
+		delete(quotaCache, key)
+		return quotaFetchResponse{}, false
+	}
+	return cached.response, true
+}
+
+func quotaCacheStore(key string, response quotaFetchResponse, now time.Time) {
+	quotaMu.Lock()
+	defer quotaMu.Unlock()
+	quotaCache[key] = cachedQuota{response: response, expires: now.Add(quotaCacheTTL)}
+}
+
 func ensureModel(body []byte, model string, stream bool) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -1151,6 +1338,10 @@ func ensureModel(body []byte, model string, stream bool) ([]byte, error) {
 		payload["model"] = strings.TrimPrefix(model, provider+"/")
 	}
 	payload["stream"] = stream
+	// Mistral bills chat requests against the Vibe & Studio budget only when
+	// the client marks them as Vibe code calls; unmarked requests consume the
+	// separate API budget even with a Vibe key.
+	payload["metadata"] = ensureVibeMetadata(payload["metadata"])
 	delete(payload, "store")
 	messages, _ := payload["messages"].([]any)
 	for _, raw := range messages {

@@ -42,6 +42,133 @@ func TestVibeCredentialRouting(t *testing.T) {
 	}
 }
 
+func TestInferenceAttributionMetadata(t *testing.T) {
+	// No metadata: both attribution fields are injected.
+	body, err := ensureModel([]byte(`{"model":"zai-glm-5-3","messages":[{"role":"user","content":"hi"}]}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" {
+		t.Fatalf("missing Vibe call source in inference metadata: %v", payload.Metadata)
+	}
+
+	// Partial metadata: unknown fields survive, call_source is forced, a
+	// caller-supplied call_type is preserved.
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":{"session_id":"abc123","call_source":"other-client"}}`), "zai-glm-5-3", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" || payload.Metadata["session_id"] != "abc123" {
+		t.Fatalf("Vibe metadata merge lost caller fields: %v", payload.Metadata)
+	}
+
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":{"call_type":"secondary_call","user_plan":"PRO"}}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "secondary_call" || payload.Metadata["user_plan"] != "PRO" {
+		t.Fatalf("Vibe metadata merge overrode the caller call_type: %v", payload.Metadata)
+	}
+
+	// Non-map metadata is replaced, never serialized as a broken field.
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":"not-an-object"}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" {
+		t.Fatalf("non-map metadata was not replaced: %v", payload.Metadata)
+	}
+}
+
+func TestQuotaBudgetMapping(t *testing.T) {
+	// Both budgets from GET /v1/billing/budget (live response shape).
+	raw := `{"vibe_budget":{"usage_percentage":11.03,"initial_budget":255.0,"currency":"EUR","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},"api_budget":{"usage_percentage":0.000049,"initial_budget":25.5,"currency":"EUR","reset_at":"2026-12-01T00:00:00Z"}}`
+	quota, err := budgetQuotaResponse([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quota.Summary) != 4 {
+		t.Fatalf("expected one initial and one remaining metric per budget: %v", quota.Summary)
+	}
+	if quota.Summary[0].Key != "vibe_initial" || quota.Summary[0].Value != 255 || quota.Summary[0].Format != "currency" || quota.Summary[0].Currency != "EUR" {
+		t.Fatalf("vibe initial metric wrong: %v", quota.Summary[0])
+	}
+	if len(quota.Groups) != 1 || len(quota.Groups[0].Buckets) != 2 {
+		t.Fatalf("expected both budgets as quota buckets: %v", quota.Groups)
+	}
+	vibe := quota.Groups[0].Buckets[0]
+	api := quota.Groups[0].Buckets[1]
+	if vibe.Window != "monthly" || vibe.ResetTime != "2026-12-01T00:00:00Z" {
+		t.Fatalf("vibe bucket window missing: %v", vibe)
+	}
+	if diff := vibe.RemainingFraction - 0.8897; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("vibe remaining fraction wrong: %v", vibe.RemainingFraction)
+	}
+	if diff := api.RemainingFraction - 0.99999951; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("api remaining fraction wrong: %v", api.RemainingFraction)
+	}
+
+	// Overshoot is clamped to an empty bucket.
+	quota, err = budgetQuotaResponse([]byte(`{"vibe_budget":{"usage_percentage":140,"initial_budget":255,"currency":"EUR"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quota.Groups[0].Buckets[0].RemainingFraction != 0 {
+		t.Fatalf("over-consumption must clamp to zero remaining: %v", quota.Groups[0].Buckets[0])
+	}
+
+	// Absent buckets are skipped, empty responses are errors.
+	quota, err = budgetQuotaResponse([]byte(`{"vibe_budget":{"usage_percentage":1,"initial_budget":255,"currency":"EUR"}}`))
+	if err != nil || len(quota.Groups[0].Buckets) != 1 {
+		t.Fatalf("missing api_budget must not fail the whole quota: %v, %v", quota, err)
+	}
+	if _, err := budgetQuotaResponse([]byte(`{}`)); err == nil {
+		t.Fatal("a budget response without budgets must error")
+	}
+	if _, err := budgetQuotaResponse([]byte(`not-json`)); err == nil {
+		t.Fatal("an invalid budget response must error")
+	}
+}
+
+func TestQuotaCacheTTL(t *testing.T) {
+	quotaMu.Lock()
+	clear := len(quotaCache)
+	quotaCache = map[string]cachedQuota{}
+	quotaMu.Unlock()
+	defer func() {
+		if clear > 0 {
+			t.Log("test replaced a non-empty quota cache")
+		}
+	}()
+	now := time.Now()
+	response := quotaFetchResponse{Summary: []quotaMetric{{Key: "vibe_initial", Label: "Vibe & Studio allowance", Value: 255, Format: "currency", Currency: "EUR"}}}
+	quotaCacheStore("auth.json", response, now)
+	if cached, ok := quotaCacheLoad("auth.json", now.Add(quotaCacheTTL-time.Second)); !ok || len(cached.Summary) != 1 {
+		t.Fatalf("fresh quota was not served from cache: %v, %v", cached, ok)
+	}
+	if _, ok := quotaCacheLoad("auth.json", now.Add(quotaCacheTTL)); ok {
+		t.Fatal("expired quota must not be served from cache")
+	}
+	if _, ok := quotaCacheLoad("auth.json", now.Add(quotaCacheTTL)); ok {
+		t.Fatal("expired quota must be evicted")
+	}
+}
+
 func TestStaticModelSurvivesCachedCatalogue(t *testing.T) {
 	extra := staticModels()[0]
 	for _, models := range [][]modelInfo{{}, {extra}} {

@@ -65,6 +65,8 @@ const (
 	schemaVersion   = 10
 	provider        = "mistral-vibe"
 	vibeUserAgent   = "Mistral-Vibe"
+	vibeCallSource  = "vibe_code"
+	vibeCallType    = "main_call"
 	clientID        = "829da7e7-628f-4795-829a-8cca609c76d4"
 	tokenURL        = "https://auth.mistral.ai/oauth2/token"
 	workspaceURL    = "https://api.mistral.ai/v1/users/me/workspaces?limit=100&offset=0"
@@ -1142,6 +1144,23 @@ func authHeaders(stored storedAuth, existing map[string][]string) map[string][]s
 	return headers
 }
 
+// ensureVibeMetadata stamps a request's metadata with the Vibe code call
+// source Mistral's budget attribution reads, preserving other fields and
+// call_type values clients may set themselves.
+func ensureVibeMetadata(existing any) map[string]any {
+	metadata := map[string]any{}
+	if raw, ok := existing.(map[string]any); ok {
+		for key, value := range raw {
+			metadata[key] = value
+		}
+	}
+	metadata["call_source"] = vibeCallSource
+	if _, ok := metadata["call_type"].(string); !ok {
+		metadata["call_type"] = vibeCallType
+	}
+	return metadata
+}
+
 func ensureModel(body []byte, model string, stream bool) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -1151,6 +1170,10 @@ func ensureModel(body []byte, model string, stream bool) ([]byte, error) {
 		payload["model"] = strings.TrimPrefix(model, provider+"/")
 	}
 	payload["stream"] = stream
+	// Mistral bills chat requests against the Vibe & Studio budget only when
+	// the client marks them as Vibe code calls; unmarked requests consume the
+	// separate API budget even with a Vibe key.
+	payload["metadata"] = ensureVibeMetadata(payload["metadata"])
 	delete(payload, "store")
 	messages, _ := payload["messages"].([]any)
 	for _, raw := range messages {

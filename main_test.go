@@ -42,6 +42,59 @@ func TestVibeCredentialRouting(t *testing.T) {
 	}
 }
 
+func TestInferenceAttributionMetadata(t *testing.T) {
+	// No metadata: both attribution fields are injected.
+	body, err := ensureModel([]byte(`{"model":"zai-glm-5-3","messages":[{"role":"user","content":"hi"}]}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" {
+		t.Fatalf("missing Vibe call source in inference metadata: %v", payload.Metadata)
+	}
+
+	// Partial metadata: unknown fields survive, call_source is forced, a
+	// caller-supplied call_type is preserved.
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":{"session_id":"abc123","call_source":"other-client"}}`), "zai-glm-5-3", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" || payload.Metadata["session_id"] != "abc123" {
+		t.Fatalf("Vibe metadata merge lost caller fields: %v", payload.Metadata)
+	}
+
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":{"call_type":"secondary_call","user_plan":"PRO"}}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "secondary_call" || payload.Metadata["user_plan"] != "PRO" {
+		t.Fatalf("Vibe metadata merge overrode the caller call_type: %v", payload.Metadata)
+	}
+
+	// Non-map metadata is replaced, never serialized as a broken field.
+	body, err = ensureModel([]byte(`{"model":"zai-glm-5-3","metadata":"not-an-object"}`), "zai-glm-5-3", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Metadata["call_source"] != "vibe_code" || payload.Metadata["call_type"] != "main_call" {
+		t.Fatalf("non-map metadata was not replaced: %v", payload.Metadata)
+	}
+}
+
 func TestStaticModelSurvivesCachedCatalogue(t *testing.T) {
 	extra := staticModels()[0]
 	for _, models := range [][]modelInfo{{}, {extra}} {
